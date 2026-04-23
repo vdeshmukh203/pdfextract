@@ -110,7 +110,7 @@ def _extract_stream(obj_bytes: bytes) -> Optional[bytes]:
 # ---------------------------------------------------------------------------
 
 _TEXT_OPS = re.compile(
-    rb"\(([^)\\]|\\.)*)\)\s*Tj"       # (text) Tj
+    rb"\(([^)\\]|\\.)*\)\s*Tj"       # (text) Tj
     rb"|\[([^\]]+)\]\s*TJ"               # [array] TJ
 )
 
