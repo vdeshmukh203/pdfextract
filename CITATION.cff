@@ -2,12 +2,13 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
 title: "pdfextract"
-abstract: "Structured content extraction from scientific PDFs including sections, figures, tables, and references"
+abstract: "Pure-Python structured text and metadata extractor for PDF documents. No external binaries or third-party packages required."
 authors:
   - family-names: Deshmukh
-    given-names: V.A.
+    given-names: Vaibhav
     alias: vdeshmukh203
-version: 0.1.0
-date-released: "2025-01-01"
+    orcid: "https://orcid.org/0000-0001-6745-7062"
+version: 0.2.0
+date-released: "2026-05-03"
 url: "https://github.com/vdeshmukh203/pdfextract"
 license: MIT
