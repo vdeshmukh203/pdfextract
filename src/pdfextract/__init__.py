@@ -1,17 +1,32 @@
 """
-pdfextract: Structured scientific PDF content extraction tool.
+pdfextract — pure-Python structured text and metadata extractor for PDF files.
 
-Parses scientific PDF documents and extracts structured content: sections,
-abstracts, figures, tables, captions, equations, citations, and metadata.
-Output is emitted as structured JSON, enabling downstream text mining,
-dataset construction, and reproducible scientific content analysis pipelines.
+This ``__init__.py`` re-exports the public API from the top-level
+``pdfextract`` module so that the package can be used both as a
+single-module install (``py-modules = ["pdfextract"]`` in pyproject.toml)
+and in a source-layout development environment where ``src/`` is on
+``sys.path``.
 """
+from pdfextract import (  # noqa: F401
+    __version__,
+    __author__,
+    __license__,
+    PDFParseError,
+    PDFExtractor,
+    ExtractionResult,
+    PageResult,
+    extract_pdf,
+    batch_extract,
+)
 
-__version__ = "0.1.0"
-__author__ = "Vaibhav Deshmukh"
-__license__ = "MIT"
-
-from .extractor import PDFExtractor
-from .schema import ExtractionResult
-
-__all__ = ["PDFExtractor", "ExtractionResult"]
+__all__ = [
+    "__version__",
+    "__author__",
+    "__license__",
+    "PDFParseError",
+    "PDFExtractor",
+    "ExtractionResult",
+    "PageResult",
+    "extract_pdf",
+    "batch_extract",
+]
