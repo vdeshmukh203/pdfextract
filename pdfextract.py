@@ -1,162 +1,272 @@
 """
-pdfextract: Extract structured text, tables, and metadata from PDF files.
+pdfextract: Extract structured text and metadata from PDF files.
 
-Pure-Python PDF parser (no external binaries required) that reads cross-reference
-tables, decodes content streams, extracts text runs with page/position metadata,
-detects table regions via whitespace analysis, and outputs plain text, Markdown,
-or JSON. Falls back gracefully on encrypted or malformed PDFs.
+Pure-Python PDF parser (no external binaries required) that reads
+cross-reference tables, follows incremental-update chains, decompresses
+FlateDecode content streams, extracts text via BT/ET block parsing,
+harvests document metadata from the Info dictionary, and outputs plain
+text, Markdown, or JSON.  Supports single-file and batch (glob) modes.
+Falls back gracefully on encrypted or structurally malformed PDFs.
 """
 from __future__ import annotations
-import re, struct, zlib, json
+
+import glob as _glob_mod
+import json
+import re
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+__version__ = "0.1.0"
+__author__ = "Vaibhav Deshmukh"
+__license__ = "MIT"
 
 # ---------------------------------------------------------------------------
-# PDF low-level parser (supports PDF 1.x; no encryption)
+# Exceptions
 # ---------------------------------------------------------------------------
+
 
 class PDFParseError(Exception):
-    pass
+    """Raised when a file cannot be parsed as a PDF."""
 
 
-def _read_bytes(path: Path) -> bytes:
-    return path.read_bytes()
+# ---------------------------------------------------------------------------
+# Low-level binary helpers
+# ---------------------------------------------------------------------------
 
 
 def _find_xref_offset(data: bytes) -> int:
-    """Locate startxref offset from end of file."""
-    tail = data[-1024:]
+    """Locate the ``startxref`` byte offset from the end of *data*."""
+    tail = data[-2048:]
     m = re.search(rb"startxref\s+(\d+)", tail)
     if not m:
-        raise PDFParseError("startxref not found.")
+        raise PDFParseError("startxref marker not found")
     return int(m.group(1))
 
 
-def _parse_xref_table(data: bytes, offset: int) -> Dict[int, int]:
-    """Parse a classic xref table. Returns {obj_id: byte_offset}."""
+def _parse_xref_table(data: bytes, offset: int) -> Tuple[Dict[int, int], Optional[int]]:
+    """
+    Parse one classical cross-reference table starting at *offset*.
+
+    Returns ``(offsets, prev_offset)`` where *prev_offset* is the value of
+    the ``/Prev`` trailer key, or ``None`` if absent.
+    """
     offsets: Dict[int, int] = {}
-    pos = offset
-    # skip 'xref'
-    chunk = data[pos:pos + 4096].decode("latin-1", errors="replace")
+    # Use a 1 MiB window so large xref tables are not truncated.
+    chunk = data[offset: offset + (1 << 20)].decode("latin-1", errors="replace")
     lines = chunk.splitlines()
     i = 0
-    if lines[i].strip() == "xref":
+    if lines and lines[i].strip() == "xref":
         i += 1
     while i < len(lines):
         header = lines[i].strip()
-        m = re.match(r"(\d+)\s+(\d+)", header)
-        if not m:
+        hm = re.match(r"(\d+)\s+(\d+)", header)
+        if not hm:
             break
-        first_obj = int(m.group(1))
-        count = int(m.group(2))
+        first_obj = int(hm.group(1))
+        count = int(hm.group(2))
         i += 1
         for j in range(count):
             if i >= len(lines):
                 break
-            entry = lines[i].strip()
+            parts = lines[i].strip().split()
             i += 1
-            parts = entry.split()
-            if len(parts) < 3:
-                continue
-            byte_off, gen, kind = parts[0], parts[1], parts[2]
-            obj_id = first_obj + j
-            if kind == "n":
-                offsets[obj_id] = int(byte_off)
-    return offsets
+            if len(parts) >= 3 and parts[2] == "n":
+                offsets[first_obj + j] = int(parts[0])
+    # Extract /Prev from the trailer dictionary for xref chaining.
+    prev: Optional[int] = None
+    trailer_m = re.search(r"trailer\s*<<(.+?)>>", chunk, re.DOTALL)
+    if trailer_m:
+        prev_m = re.search(r"/Prev\s+(\d+)", trailer_m.group(1))
+        if prev_m:
+            prev = int(prev_m.group(1))
+    return offsets, prev
+
+
+def _collect_xref(data: bytes) -> Dict[int, int]:
+    """Walk the full xref chain, merging all incremental updates."""
+    offset: Optional[int] = _find_xref_offset(data)
+    merged: Dict[int, int] = {}
+    seen: set = set()
+    while offset is not None and offset not in seen:
+        seen.add(offset)
+        partial, prev = _parse_xref_table(data, offset)
+        # Earlier revisions have lower priority; do not overwrite later entries.
+        for oid, off in partial.items():
+            if oid not in merged:
+                merged[oid] = off
+        offset = prev
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Object and stream parsing
+# ---------------------------------------------------------------------------
 
 
 def _parse_obj(data: bytes, byte_off: int) -> Tuple[int, bytes]:
-    """Extract the raw bytes of one indirect object."""
-    chunk = data[byte_off:byte_off + 65536]
-    m = re.search(rb"(\d+)\s+(\d+)\s+obj", chunk)
+    """
+    Extract the body of one indirect object.
+
+    Returns ``(obj_id, body_bytes)`` where *body_bytes* runs from after the
+    ``obj`` keyword to just before ``endobj``.
+    """
+    chunk = data[byte_off: byte_off + (1 << 17)]  # 128 KiB window
+    m = re.search(rb"(\d+)\s+\d+\s+obj", chunk)
     if not m:
-        raise PDFParseError("obj marker not found at offset " + str(byte_off))
-    start = m.end()
-    # find matching endobj
-    end_m = re.search(rb"endobj", chunk[start:])
-    if not end_m:
-        return int(m.group(1)), chunk[start:]
-    return int(m.group(1)), chunk[start:start + end_m.start()]
+        raise PDFParseError(f"obj marker not found at offset {byte_off}")
+    oid = int(m.group(1))
+    body_start = m.end()
+    end_m = re.search(rb"\bendobj\b", chunk[body_start:])
+    body = chunk[body_start: body_start + end_m.start()] if end_m else chunk[body_start:]
+    return oid, body
 
 
 def _decode_flate(raw: bytes) -> bytes:
-    try:
-        return zlib.decompress(raw)
-    except zlib.error:
+    """Decompress a FlateDecode stream, tolerating common truncation issues."""
+    for wbits in (15, -15):
         try:
-            return zlib.decompress(raw, -15)
+            return zlib.decompress(raw, wbits)
         except zlib.error:
-            return raw
+            pass
+    try:
+        d = zlib.decompressobj(-15)
+        return d.decompress(raw) + d.flush(zlib.Z_SYNC_FLUSH)
+    except zlib.error:
+        return raw
 
 
 def _extract_stream(obj_bytes: bytes) -> Optional[bytes]:
-    """Extract and decompress a PDF stream from an object body."""
+    """Extract and optionally decompress the stream data from an object body."""
     m = re.search(rb"stream\r?\n", obj_bytes)
     if not m:
         return None
     stream_start = m.end()
-    end_m = re.search(rb"endstream", obj_bytes[stream_start:])
-    raw = obj_bytes[stream_start:stream_start + (end_m.start() if end_m else len(obj_bytes))]
-    # Check for FlateDecode
+    end_m = re.search(rb"\bendstream\b", obj_bytes[stream_start:])
+    raw = obj_bytes[stream_start: stream_start + (end_m.start() if end_m else len(obj_bytes))]
     if b"FlateDecode" in obj_bytes[:stream_start]:
         raw = _decode_flate(raw)
     return raw
 
 
 # ---------------------------------------------------------------------------
-# Text extraction from content streams
+# Metadata extraction
 # ---------------------------------------------------------------------------
 
-_TEXT_OPS = re.compile(
-    rb"\(([^)\\]|\\.)*\)\s*Tj"       # (text) Tj
-    rb"|\[([^\]]+)\]\s*TJ"               # [array] TJ
+_INFO_KEYS = (
+    "Title", "Author", "Subject", "Keywords",
+    "Creator", "Producer", "CreationDate", "ModDate",
 )
+
+
+def _extract_info_dict(data: bytes, xref: Dict[int, int]) -> Dict[str, str]:
+    """
+    Parse the PDF Info dictionary and return a ``{key: value}`` mapping.
+
+    Handles both literal-string ``(…)`` and hex-string ``<…>`` encodings,
+    including UTF-16 BE strings introduced by a ``0xFEFF`` BOM.
+    """
+    tail = data[-8192:].decode("latin-1", errors="replace")
+    trailer_m = re.search(r"trailer\s*<<(.+?)>>", tail, re.DOTALL)
+    if not trailer_m:
+        return {}
+    info_m = re.search(r"/Info\s+(\d+)\s+\d+\s+R", trailer_m.group(1))
+    if not info_m:
+        return {}
+    info_id = int(info_m.group(1))
+    if info_id not in xref:
+        return {}
+    try:
+        _, obj_body = _parse_obj(data, xref[info_id])
+    except PDFParseError:
+        return {}
+
+    result: Dict[str, str] = {}
+    obj_text = obj_body.decode("latin-1", errors="replace")
+    for key in _INFO_KEYS:
+        # Literal string form: /Key (value)
+        lm = re.search(r"/" + key + r"\s*\(([^)]*)\)", obj_text)
+        if lm:
+            result[key] = _decode_pdf_string(lm.group(1).encode("latin-1"))
+            continue
+        # Hex string form: /Key <hexdigits>
+        hm = re.search(r"/" + key + r"\s*<([0-9a-fA-F\s]+)>", obj_text)
+        if hm:
+            hex_bytes = bytes.fromhex(re.sub(r"\s", "", hm.group(1)))
+            if hex_bytes[:2] == b"\xfe\xff":
+                result[key] = hex_bytes[2:].decode("utf-16-be", errors="replace")
+            else:
+                result[key] = hex_bytes.decode("latin-1", errors="replace")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Text extraction from content streams
+# ---------------------------------------------------------------------------
 
 _BT_ET = re.compile(rb"BT(.+?)ET", re.DOTALL)
 _STRING_RE = re.compile(rb"\(([^)\\]|\\.)*\)")
 
 
 def _decode_pdf_string(s: bytes) -> str:
-    """Decode a PDF literal string, handling \ooo octal and common escapes."""
-    out = []
+    """
+    Decode a PDF literal string, correctly handling:
+
+    * ``\\n`` ``\\r`` ``\\t`` ``\\(`` ``\\)`` ``\\\\`` escape sequences
+    * Octal escapes ``\\ooo`` (1–3 digits)
+    * Raw latin-1 bytes for all other characters
+    """
+    out: List[str] = []
     i = 0
     while i < len(s):
-        c = s[i:i+1]
-        if c == b"\\":
+        b = s[i]
+        if b == ord("\\"):
             i += 1
-            nc = s[i:i+1]
-            if nc in (b"n",):   out.append("\n")
-            elif nc in (b"r",): out.append("\r")
-            elif nc in (b"t",): out.append("\t")
-            elif nc in (b"(",): out.append("(")
-            elif nc in (b")",): out.append(")")
-            elif nc.isdigit():
-                octal = s[i:i+3]
-                out.append(chr(int(octal, 8)))
-                i += 2
+            if i >= len(s):
+                break
+            nc = s[i]
+            if nc == ord("n"):
+                out.append("\n")
+            elif nc == ord("r"):
+                out.append("\r")
+            elif nc == ord("t"):
+                out.append("\t")
+            elif nc == ord("("):
+                out.append("(")
+            elif nc == ord(")"):
+                out.append(")")
+            elif nc == ord("\\"):
+                out.append("\\")
+            elif chr(nc).isdigit():
+                # Octal: 1–3 digits; do NOT include the initial digit in i
+                j = i
+                while j < i + 3 and j < len(s) and chr(s[j]).isdigit():
+                    j += 1
+                out.append(chr(int(s[i:j].decode(), 8) & 0xFF))
+                i = j
+                continue  # skip the i += 1 below
             else:
-                out.append(nc.decode("latin-1", errors="replace"))
+                out.append(chr(nc))
         else:
-            out.append(c.decode("latin-1", errors="replace"))
+            out.append(chr(b))
         i += 1
     return "".join(out)
 
 
 def _extract_text_from_stream(stream: bytes) -> str:
-    """Pull text from a PDF content stream using simple BT/ET block parsing."""
+    """Extract text from a PDF content stream via BT/ET block parsing."""
     parts: List[str] = []
     for bt_block in _BT_ET.finditer(stream):
         block = bt_block.group(1)
-        for string_m in _STRING_RE.finditer(block):
-            raw = string_m.group(0)[1:-1]  # strip parens
+        # Literal strings used with Tj, Td, etc.
+        for sm in _STRING_RE.finditer(block):
+            raw = sm.group(0)[1:-1]  # strip outer parens
             parts.append(_decode_pdf_string(raw))
-        # Also catch bare TJ arrays
-        for tj_m in re.finditer(rb"\[([^\]]+)\]\s*TJ", block):
-            inner = tj_m.group(1)
-            for s in _STRING_RE.finditer(inner):
-                raw = s.group(0)[1:-1]
+        # Array form used with TJ
+        for tj_m in re.finditer(rb"\[([^\]]*)\]\s*TJ", block):
+            for sm in _STRING_RE.finditer(tj_m.group(1)):
+                raw = sm.group(0)[1:-1]
                 parts.append(_decode_pdf_string(raw))
     return " ".join(p.strip() for p in parts if p.strip())
 
@@ -165,20 +275,25 @@ def _extract_text_from_stream(stream: bytes) -> str:
 # Data model
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class PageResult:
-    page_number: int          # 1-based
-    text: str
-    word_count: int = 0
-    char_count: int = 0
+    """Text content extracted from one PDF page."""
 
-    def __post_init__(self):
+    page_number: int  # 1-based
+    text: str
+    word_count: int = field(init=False)
+    char_count: int = field(init=False)
+
+    def __post_init__(self) -> None:
         self.word_count = len(self.text.split())
         self.char_count = len(self.text)
 
 
 @dataclass
 class ExtractionResult:
+    """Aggregated extraction output for an entire PDF document."""
+
     source: str
     page_count: int
     pages: List[PageResult] = field(default_factory=list)
@@ -187,6 +302,7 @@ class ExtractionResult:
 
     @property
     def full_text(self) -> str:
+        """All pages joined by blank lines, skipping empty pages."""
         return "\n\n".join(p.text for p in self.pages if p.text.strip())
 
     @property
@@ -200,25 +316,26 @@ class ExtractionResult:
             "word_count": self.word_count,
             "metadata": self.metadata,
             "errors": self.errors,
-            "pages": [{"page": p.page_number, "text": p.text,
-                       "words": p.word_count} for p in self.pages],
+            "pages": [
+                {"page": p.page_number, "text": p.text, "words": p.word_count}
+                for p in self.pages
+            ],
         }
 
     def to_markdown(self) -> str:
-        lines = [
-            "# Extracted Text: " + self.source, "",
-            "**Pages**: " + str(self.page_count) + " | **Words**: " + str(self.word_count), "",
+        lines: List[str] = [
+            f"# Extracted Text: {self.source}",
+            "",
+            f"**Pages**: {self.page_count} | **Words**: {self.word_count}",
+            "",
         ]
         if self.metadata:
             lines += ["## Metadata", ""]
             for k, v in self.metadata.items():
-                lines.append("- **" + k + "**: " + v)
+                lines.append(f"- **{k}**: {v}")
             lines.append("")
         for page in self.pages:
-            lines += [
-                "## Page " + str(page.page_number), "",
-                page.text, "",
-            ]
+            lines += [f"## Page {page.page_number}", "", page.text, ""]
         return "\n".join(lines)
 
 
@@ -226,17 +343,20 @@ class ExtractionResult:
 # Main extractor
 # ---------------------------------------------------------------------------
 
+
 class PDFExtractor:
     """
     Extract text and metadata from a PDF file without external binaries.
 
     Parameters
     ----------
-    path : str
+    path : str or pathlib.Path
         Path to the PDF file.
     max_pages : int, optional
-        Stop after this many pages. 0 = all pages.
+        Stop after this many pages (0 = unlimited).
     """
+
+    _PAGE_RE = re.compile(rb"/Type\s*/Page\b")
 
     def __init__(self, path: str, max_pages: int = 0) -> None:
         self.path = Path(path)
@@ -244,50 +364,96 @@ class PDFExtractor:
         self._data: bytes = b""
 
     def _load(self) -> None:
-        self._data = _read_bytes(self.path)
-        magic = self._data[:4]
-        if magic != b"%PDF":
-            raise PDFParseError("Not a PDF file: " + str(self.path))
+        self._data = self.path.read_bytes()
+        if not self._data.startswith(b"%PDF"):
+            raise PDFParseError(f"Not a PDF file: {self.path}")
 
     def _get_xref(self) -> Dict[int, int]:
-        offset = _find_xref_offset(self._data)
-        return _parse_xref_table(self._data, offset)
+        return _collect_xref(self._data)
 
     def _get_page_streams(self, xref: Dict[int, int]) -> Iterator[Tuple[int, bytes]]:
-        """Yield (page_index, content_stream_bytes)."""
+        """Yield ``(page_number, content_stream_bytes)`` for each page."""
         page_num = 0
         for obj_id in sorted(xref.keys()):
-            byte_off = xref[obj_id]
             try:
-                _, obj_body = _parse_obj(self._data, byte_off)
+                _, obj_body = _parse_obj(self._data, xref[obj_id])
             except PDFParseError:
                 continue
-            # Heuristic: objects containing /Type /Page with /Contents
-            if b"/Type /Page" in obj_body or b"/Type\n/Page" in obj_body:
-                stream = _extract_stream(obj_body)
-                if stream:
-                    page_num += 1
-                    yield page_num, stream
-                    if self.max_pages and page_num >= self.max_pages:
-                        return
+            if not self._PAGE_RE.search(obj_body):
+                continue
+            stream = self._resolve_page_stream(obj_body, xref)
+            page_num += 1
+            yield page_num, stream if stream is not None else b""
+            if self.max_pages and page_num >= self.max_pages:
+                return
+
+    def _resolve_page_stream(
+        self, page_body: bytes, xref: Dict[int, int]
+    ) -> Optional[bytes]:
+        """
+        Return the content stream for a page object.
+
+        Tries three strategies in order:
+        1. Inline stream in the page object itself.
+        2. Single ``/Contents N M R`` indirect reference.
+        3. ``/Contents [N M R …]`` array of references (streams concatenated).
+        """
+        # Strategy 1: inline stream
+        stream = _extract_stream(page_body)
+        if stream is not None:
+            return stream
+
+        # Strategy 2: single /Contents reference
+        single_m = re.search(rb"/Contents\s+(\d+)\s+\d+\s+R", page_body)
+        if single_m:
+            ref_id = int(single_m.group(1))
+            if ref_id in xref:
+                try:
+                    _, body = _parse_obj(self._data, xref[ref_id])
+                    stream = _extract_stream(body)
+                    if stream is not None:
+                        return stream
+                except PDFParseError:
+                    pass
+
+        # Strategy 3: /Contents array
+        array_m = re.search(rb"/Contents\s*\[([^\]]+)\]", page_body)
+        if array_m:
+            parts: List[bytes] = []
+            for ref_m in re.finditer(rb"(\d+)\s+\d+\s+R", array_m.group(1)):
+                ref_id = int(ref_m.group(1))
+                if ref_id in xref:
+                    try:
+                        _, body = _parse_obj(self._data, xref[ref_id])
+                        s = _extract_stream(body)
+                        if s:
+                            parts.append(s)
+                    except PDFParseError:
+                        pass
+            if parts:
+                return b"\n".join(parts)
+
+        return None
 
     def extract(self) -> ExtractionResult:
-        """Run extraction. Returns ExtractionResult."""
+        """Run extraction and return an :class:`ExtractionResult`."""
         self._load()
         result = ExtractionResult(source=self.path.name, page_count=0)
         errors: List[str] = []
         try:
             xref = self._get_xref()
         except PDFParseError as exc:
-            result.errors.append("xref error: " + str(exc))
+            result.errors.append(f"xref error: {exc}")
             return result
+
+        result.metadata = _extract_info_dict(self._data, xref)
 
         pages: List[PageResult] = []
         for page_num, stream in self._get_page_streams(xref):
             try:
-                text = _extract_text_from_stream(stream)
-            except Exception as exc:
-                errors.append("page " + str(page_num) + " error: " + str(exc))
+                text = _extract_text_from_stream(stream) if stream else ""
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"page {page_num} error: {exc}")
                 text = ""
             pages.append(PageResult(page_number=page_num, text=text))
 
@@ -298,8 +464,9 @@ class PDFExtractor:
 
 
 # ---------------------------------------------------------------------------
-# Convenience function
+# Convenience functions
 # ---------------------------------------------------------------------------
+
 
 def extract_pdf(
     path: str,
@@ -308,26 +475,25 @@ def extract_pdf(
     max_pages: int = 0,
 ) -> str:
     """
-    Extract text from a PDF and optionally write to a file.
+    Extract text from a single PDF file.
 
     Parameters
     ----------
     path : str
-        Input PDF path.
+        Path to the input PDF.
     output_format : str
-        "text", "markdown", or "json".
+        ``"text"`` (default), ``"markdown"``, or ``"json"``.
     output_path : str, optional
-        If given, write output to this file.
+        If provided, the extracted content is also written to this file.
     max_pages : int
-        Maximum number of pages to extract (0 = all).
+        Maximum number of pages to process (0 = all).
 
     Returns
     -------
     str
-        Extracted text in the requested format.
+        Extracted content in the requested format.
     """
-    extractor = PDFExtractor(path, max_pages=max_pages)
-    result = extractor.extract()
+    result = PDFExtractor(path, max_pages=max_pages).extract()
     if output_format == "json":
         out = json.dumps(result.to_dict(), indent=2, ensure_ascii=False)
     elif output_format == "markdown":
@@ -339,32 +505,144 @@ def extract_pdf(
     return out
 
 
+def batch_extract(
+    pattern: str,
+    output_format: str = "text",
+    output_dir: Optional[str] = None,
+    max_pages: int = 0,
+) -> List[ExtractionResult]:
+    """
+    Extract text from all PDFs matching a glob *pattern*.
+
+    Parameters
+    ----------
+    pattern : str
+        Glob pattern, e.g. ``"papers/*.pdf"``.
+    output_format : str
+        ``"text"``, ``"markdown"``, or ``"json"``.
+    output_dir : str, optional
+        Directory into which per-file output files are written.
+    max_pages : int
+        Per-file page limit (0 = all).
+
+    Returns
+    -------
+    list of ExtractionResult
+    """
+    _ext_map = {"text": ".txt", "markdown": ".md", "json": ".json"}
+    out_dir = Path(output_dir) if output_dir else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    results: List[ExtractionResult] = []
+    for pdf_path in sorted(_glob_mod.glob(pattern)):
+        result = PDFExtractor(pdf_path, max_pages=max_pages).extract()
+        results.append(result)
+        if out_dir:
+            out_file = out_dir / (Path(pdf_path).stem + _ext_map.get(output_format, ".txt"))
+            if output_format == "json":
+                out_file.write_text(
+                    json.dumps(result.to_dict(), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            elif output_format == "markdown":
+                out_file.write_text(result.to_markdown(), encoding="utf-8")
+            else:
+                out_file.write_text(result.full_text, encoding="utf-8")
+    return results
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _cli() -> None:
     import argparse
+    import sys
+
     parser = argparse.ArgumentParser(
         prog="pdfextract",
         description="Extract structured text and metadata from PDF files.",
     )
-    parser.add_argument("input", help="Path to input PDF file.")
-    parser.add_argument("-o", "--output", default=None, help="Output file path.")
-    parser.add_argument(
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    # ── extract (single file) ──────────────────────────────────────────────
+    ep = sub.add_parser("extract", help="Extract text from a single PDF.")
+    ep.add_argument("input", help="Path to the PDF file.")
+    ep.add_argument("-o", "--output", default=None, help="Output file path.")
+    ep.add_argument(
+        "-f", "--format",
+        choices=["text", "markdown", "json"],
+        default="text",
+        dest="fmt",
+        help="Output format (default: text).",
+    )
+    ep.add_argument("-p", "--max-pages", type=int, default=0,
+                    help="Maximum pages to extract (0 = all).")
+
+    # ── batch ─────────────────────────────────────────────────────────────
+    bp = sub.add_parser("batch", help="Extract multiple PDFs matching a glob.")
+    bp.add_argument("pattern", help="Glob pattern, e.g. 'papers/*.pdf'.")
+    bp.add_argument("-d", "--output-dir", default=None,
+                    help="Directory for output files.")
+    bp.add_argument(
         "-f", "--format",
         choices=["text", "markdown", "json"],
         default="text",
         dest="fmt",
     )
-    parser.add_argument("-p", "--max-pages", type=int, default=0)
+    bp.add_argument("-p", "--max-pages", type=int, default=0)
+
+    # ── gui ───────────────────────────────────────────────────────────────
+    sub.add_parser("gui", help="Launch the graphical user interface.")
+
+    # ── legacy positional (no subcommand) ─────────────────────────────────
+    parser.add_argument("input_file", nargs="?", help=argparse.SUPPRESS)
+    parser.add_argument("-o", "--output", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "-f", "--format",
+        choices=["text", "markdown", "json"],
+        default="text",
+        dest="fmt",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("-p", "--max-pages", type=int, default=0,
+                        help=argparse.SUPPRESS)
+
     args = parser.parse_args()
-    out = extract_pdf(args.input, output_format=args.fmt,
-                      output_path=args.output, max_pages=args.max_pages)
+
+    if args.command == "gui":
+        from pdfextract_gui import main as _gui_main
+        _gui_main()
+        return
+
+    if args.command == "batch":
+        results = batch_extract(
+            args.pattern,
+            output_format=args.fmt,
+            output_dir=args.output_dir,
+            max_pages=args.max_pages,
+        )
+        print(f"Processed {len(results)} file(s).")
+        return
+
+    # Single file — either via 'extract' subcommand or legacy positional arg.
+    pdf_path = getattr(args, "input", None) or getattr(args, "input_file", None)
+    if not pdf_path:
+        parser.print_help()
+        sys.exit(0)
+    out = extract_pdf(
+        pdf_path,
+        output_format=args.fmt,
+        output_path=args.output,
+        max_pages=args.max_pages,
+    )
     if not args.output:
         print(out)
     else:
-        print("Written to " + args.output)
+        print(f"Written to {args.output}")
 
 
 if __name__ == "__main__":

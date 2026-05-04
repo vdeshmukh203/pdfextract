@@ -16,12 +16,34 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Text Processing",
     "Topic :: Scientific/Engineering",
+    "Topic :: Utilities",
 ]
+
+# No mandatory third-party dependencies; Tkinter (stdlib) is used by the GUI.
+dependencies = []
+
+[project.optional-dependencies]
+gui = []   # Tkinter ships with CPython; install python3-tk on Linux if absent.
+dev = ["pytest>=7"]
 
 [project.scripts]
 pdfextract = "pdfextract:_cli"
+pdfextract-gui = "pdfextract_gui:main"
+
+[project.urls]
+Homepage = "https://github.com/vdeshmukh203/pdfextract"
+Repository = "https://github.com/vdeshmukh203/pdfextract"
+"Bug Tracker" = "https://github.com/vdeshmukh203/pdfextract/issues"
 
 [tool.setuptools]
-py-modules = ["pdfextract"]
+py-modules = ["pdfextract", "pdfextract_gui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
