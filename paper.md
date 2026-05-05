@@ -1,12 +1,11 @@
 ---
-title: 'pdfextract: Structured extraction of text, tables, and figures from scientific PDF documents'
+title: 'pdfextract: Pure-Python extraction of text and metadata from PDF files'
 tags:
   - Python
   - PDF
-  - extraction
-  - NLP
-  - scientific-computing
-  - text-mining
+  - text extraction
+  - scientific computing
+  - text mining
 authors:
   - name: Vaibhav Deshmukh
     orcid: 0000-0001-6745-7062
@@ -14,20 +13,75 @@ authors:
 affiliations:
   - name: Independent Researcher, Nagpur, India
     index: 1
-date: 23 April 2026
+date: 5 May 2026
 bibliography: paper.bib
 ---
 
 # Summary
 
-`pdfextract` is a Python library and command-line tool for structured extraction of content from scientific PDF documents. It combines PDF parsing (via `pdfminer.six`), table detection (via heuristic whitespace analysis and `camelot`), and figure boundary detection (via bounding-box analysis of non-text PDF objects) to produce structured output in JSON or Markdown format. Extracted content includes section-segmented body text, tables as pandas DataFrames, figure captions, and metadata (title, authors, abstract, DOI). `pdfextract` is designed for batch processing of paper corpora in systematic review and meta-analysis pipelines.
+`pdfextract` is a pure-Python library and command-line tool for extracting text
+and metadata from PDF files without requiring any external binaries or compiled
+dependencies. It implements a self-contained PDF parser that reads cross-reference
+tables (both classic PDF 1.x tables and PDF 1.5+ cross-reference streams),
+decodes FlateDecode content streams, resolves indirect object references, and
+extracts UTF-16-BE and Latin-1 encoded text from BT/ET operator blocks. Extracted
+content is returned as structured Python objects and can be serialised to plain
+text, Markdown, or JSON. An optional tkinter-based graphical interface is bundled
+for interactive use.
 
 # Statement of Need
 
-Scientific text mining pipelines require reliable extraction of structured content from PDF documents, but existing tools either require commercial licences, lack section-awareness, or produce poorly structured output that requires extensive post-processing [@gao2023reproducibility]. `pdfextract` targets the research workflow of processing hundreds to thousands of papers: it provides a batch mode, consistent JSON output schema, and graceful degradation when content cannot be reliably extracted rather than silently producing malformed output. The structured output integrates directly with downstream NLP tools, enabling reproducible corpus construction for meta-analyses and systematic literature reviews [@stodden2016enhancing; @pineau2021improving].
+Many scientific workflows require bulk extraction of text from PDF corpora —
+for systematic literature reviews, meta-analyses, and NLP corpus construction
+[@stodden2016enhancing; @pineau2021improving]. Existing tools often depend on
+external binaries (Poppler, Ghostscript), require platform-specific installation,
+or carry large transitive dependency trees that complicate reproducible environment
+setup [@gao2023reproducibility]. `pdfextract` addresses this by providing a
+zero-dependency pure-Python implementation that works wherever Python 3.8+
+runs — including locked-down HPC environments, Docker containers, and web-hosted
+notebooks. Graceful degradation on encrypted or malformed PDFs (returning partial
+results with annotated error lists rather than raising unhandled exceptions)
+makes it suitable for untrusted batch input.
+
+The library exposes a stable Python API (`PDFExtractor`, `extract_pdf`) and a
+`pdfextract` CLI so it integrates into both script-based and interactive
+workflows. The structured `ExtractionResult` dataclass carries per-page text,
+word and character counts, and key–value metadata (title, author, creation date),
+enabling downstream analysis without bespoke post-processing.
+
+# Implementation
+
+The parser pipeline has four stages:
+
+1. **Cross-reference resolution.** The byte offset of the xref section is
+   located via the `startxref` trailer token. Classic `xref` tables are
+   parsed line-by-line; PDF 1.5+ cross-reference streams are decoded using
+   the `/W` field-width descriptor and FlateDecode decompression.
+
+2. **Object parsing.** Each indirect object is located by its xref-table
+   byte offset. Page objects are identified by the `/Type /Page` dictionary
+   key (matched via regex to tolerate arbitrary whitespace). The `/Contents`
+   key is followed — as a single indirect reference or an array of references
+   — to retrieve the associated content stream(s).
+
+3. **Stream decoding.** FlateDecode streams are decompressed with `zlib`.
+   The decompressor retries with a raw-deflate window flag (`wbits = -15`)
+   when standard decompression fails, recovering many files with missing
+   zlib headers.
+
+4. **Text extraction.** PDF literal strings inside BT/ET operator blocks
+   are decoded with full support for octal escape sequences (1–3 digits),
+   two-character escape sequences, line continuations, and UTF-16-BE BOM
+   detection. Both `Tj` (single string) and `TJ` (glyph-spacing array)
+   operators are handled.
+
+Metadata (title, author, subject, keywords, creator, producer, creation date)
+is extracted from the PDF Info dictionary referenced in the file trailer.
 
 # Acknowledgements
 
-The author used Claude (Anthropic) for drafting portions of this manuscript. All scientific claims and design decisions are the author's own.
+The author used Claude (Anthropic) for drafting portions of this manuscript
+and for code-review assistance. All scientific claims and design decisions
+are the author's own.
 
 # References
