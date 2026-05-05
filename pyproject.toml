@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdfextract"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pure-Python structured text and metadata extractor for PDF files"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -23,5 +23,8 @@ classifiers = [
 [project.scripts]
 pdfextract = "pdfextract:_cli"
 
-[tool.setuptools]
-py-modules = ["pdfextract"]
+[project.gui-scripts]
+pdfextract-gui = "pdfextract.gui:launch"
+
+[tool.setuptools.packages.find]
+where = ["src"]
