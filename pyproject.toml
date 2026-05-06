@@ -4,24 +4,49 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdfextract"
-version = "0.1.0"
-description = "Pure-Python structured text and metadata extractor for PDF files"
+version = "0.2.0"
+description = "Structured text and metadata extractor for PDF files"
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [{name = "Vaibhav Deshmukh", email = "vdeshmukh203@gmail.com"}]
 requires-python = ">=3.8"
-keywords = ["pdf", "extraction", "text", "parsing", "research", "reproducibility"]
+keywords = ["pdf", "extraction", "text", "parsing", "research", "reproducibility", "nlp"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Text Processing",
     "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "pdfminer.six>=20220319",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-cov>=4",
 ]
 
 [project.scripts]
 pdfextract = "pdfextract:_cli"
 
-[tool.setuptools]
-py-modules = ["pdfextract"]
+[project.gui-scripts]
+pdfextract-gui = "pdfextract.gui:run_gui"
+
+[project.urls]
+Homepage = "https://github.com/vdeshmukh203/pdfextract"
+Repository = "https://github.com/vdeshmukh203/pdfextract"
+"Bug Tracker" = "https://github.com/vdeshmukh203/pdfextract/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
