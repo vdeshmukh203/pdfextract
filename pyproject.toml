@@ -21,7 +21,11 @@ classifiers = [
 ]
 
 [project.scripts]
-pdfextract = "pdfextract:_cli"
+pdfextract = "pdfextract.cli:main"
+pdfextract-gui = "pdfextract.gui:launch"
 
-[tool.setuptools]
-py-modules = ["pdfextract"]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

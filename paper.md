@@ -1,5 +1,5 @@
 ---
-title: 'pdfextract: Structured extraction of text, tables, and figures from scientific PDF documents'
+title: 'pdfextract: A pure-Python tool for structured text and metadata extraction from PDF documents'
 tags:
   - Python
   - PDF
@@ -20,14 +20,31 @@ bibliography: paper.bib
 
 # Summary
 
-`pdfextract` is a Python library and command-line tool for structured extraction of content from scientific PDF documents. It combines PDF parsing (via `pdfminer.six`), table detection (via heuristic whitespace analysis and `camelot`), and figure boundary detection (via bounding-box analysis of non-text PDF objects) to produce structured output in JSON or Markdown format. Extracted content includes section-segmented body text, tables as pandas DataFrames, figure captions, and metadata (title, authors, abstract, DOI). `pdfextract` is designed for batch processing of paper corpora in systematic review and meta-analysis pipelines.
+`pdfextract` is a pure-Python library and command-line tool for extracting structured text and metadata from PDF documents. It implements its own cross-reference table parser and content-stream decoder using only the Python standard library, so no external binaries or native dependencies are required. Extracted content includes page-level text with word and character counts, document metadata recovered from the PDF Info dictionary (title, author, subject, keywords, creator), and a structured representation of errors encountered during parsing. Output is available as plain text, Markdown, or JSON, enabling integration with downstream NLP and text-mining pipelines. A desktop GUI built with Tkinter provides a point-and-click interface for users who prefer not to use the command line.
 
 # Statement of Need
 
-Scientific text mining pipelines require reliable extraction of structured content from PDF documents, but existing tools either require commercial licences, lack section-awareness, or produce poorly structured output that requires extensive post-processing [@gao2023reproducibility]. `pdfextract` targets the research workflow of processing hundreds to thousands of papers: it provides a batch mode, consistent JSON output schema, and graceful degradation when content cannot be reliably extracted rather than silently producing malformed output. The structured output integrates directly with downstream NLP tools, enabling reproducible corpus construction for meta-analyses and systematic literature reviews [@stodden2016enhancing; @pineau2021improving].
+Scientific text-mining pipelines frequently need to process large corpora of PDF documents—systematic reviews, meta-analyses, and reproducibility studies routinely involve hundreds to thousands of papers [@gao2023reproducibility; @stodden2016enhancing; @pineau2021improving]. Existing tools often depend on Java runtimes, C-extension libraries, or commercial APIs, creating friction for researchers working in constrained computing environments or seeking fully reproducible pipelines. `pdfextract` addresses this gap with a dependency-free Python implementation that:
+
+1. **Runs anywhere Python runs** — no external binaries, no JVM, no compiled extensions.
+2. **Degrades gracefully** — returns partial results with structured error messages rather than raising unhandled exceptions on malformed or encrypted PDFs.
+3. **Emits machine-readable output** — a consistent JSON schema makes it straightforward to feed results into pandas, spaCy, or any other downstream tool.
+4. **Supports batch automation** — the CLI and Python API accept any number of files, making it easy to embed in shell scripts or workflow managers.
+
+The GUI lowers the barrier to entry for researchers who need occasional one-off extraction without writing Python code.
+
+# Implementation
+
+`pdfextract` is structured as a `src`-layout Python package with three public modules:
+
+- **`extractor`** — low-level PDF parser: locates and decodes the cross-reference table, decompresses FlateDecode content streams (zlib), and heuristically identifies page content objects.
+- **`schema`** — dataclasses `PageResult` and `ExtractionResult` that carry extracted text, counts, metadata, and error lists; serialisation to plain text, Markdown, and JSON.
+- **`gui`** — a Tkinter desktop application providing a file browser, format selector, scrollable text preview, and save dialog.
+
+Text extraction operates on the BT/ET (Begin Text / End Text) block structure mandated by the PDF specification [@adobepdfref]. Within each block, both literal PDF strings `(...)` and hex strings `<...>` are decoded, including octal escape sequences and common two-character backslash escapes. The extractor also follows `/Contents` indirect references so that pages whose streams are stored as separate objects are handled correctly.
 
 # Acknowledgements
 
-The author used Claude (Anthropic) for drafting portions of this manuscript. All scientific claims and design decisions are the author's own.
+The author used Claude (Anthropic) for assistance during development. All scientific claims and design decisions are the author's own.
 
 # References
